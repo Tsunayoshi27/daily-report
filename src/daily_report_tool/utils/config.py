@@ -125,6 +125,8 @@ class Config:
 
     # ---- 日报主体与推送对象 ----
     report_author: str = "未命名员工"
+    # 用于识别"我"的账号别名（Gitee/GitHub 登录名或昵称，逗号分隔）；留空则等同于 report_author
+    report_identities: tuple[str, ...] = ()
     report_role: str = "dev"
     email_recipients: tuple[str, ...] = ()
 
@@ -168,6 +170,7 @@ class Config:
             feishu_base_url=_env("FEISHU_BASE_URL", default="https://open.feishu.cn"),
             feishu_task_path=_env("FEISHU_TASK_PATH", default="/open-apis/task/v1/tasks"),
             report_author=_env("REPORT_AUTHOR", default="未命名员工"),
+            report_identities=_env_list("REPORT_IDENTITIES"),
             report_role=_env("REPORT_ROLE", default="dev").lower(),
             email_recipients=_env_list("EMAIL_RECIPIENTS"),
             db_path=Path(_env("DB_PATH", default=str(_DEFAULT_DB_PATH))),

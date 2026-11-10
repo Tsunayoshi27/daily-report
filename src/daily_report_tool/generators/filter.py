@@ -89,8 +89,13 @@ _FILLER_WORDS: tuple[str, ...] = (
 
 
 def _is_structure_line(text: str) -> bool:
-    """判断是否为段标记或 Markdown 标题行（不参与空话统计）。"""
-    return bool(SECTION_PATTERN.match(text)) or text.startswith("#")
+    """判断是否为段标记、Markdown 标题或分组小标题（不参与空话统计）。"""
+    return (
+        bool(SECTION_PATTERN.match(text))
+        or text.startswith("#")
+        or text.startswith("**")
+        or text.startswith("工作量")
+    )
 
 
 def is_empty_talk(text: str) -> bool:

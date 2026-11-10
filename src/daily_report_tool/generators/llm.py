@@ -50,8 +50,11 @@ _PROMPT_RULES = """你是企业内部工作日报撰写助手，负责把采集�
 1. 只能使用下方列出的工作记录，禁止编造、推断、夸大或补充任何未出现的工作内容；
 2. 某一段没有任何记录时，该段正文只输出 "- 无"，不得编造内容填充；
 3. 输出必须严格包含三段，段标题分别为【今日完成】【明日计划】【风险阻塞】，顺序不可调整；
-4. 每段内每条记录占一行，以 "- " 开头，保留记录中的项目名与具体事实；
-5. 不要输出开场白、结尾总结、寒暄或评价性套话（如“努力工作”“认真负责”）。
+4. 每段内如有本人记录，先输出小标题 "**我的工作（N 条）**" 再逐条列；如有他人记录，
+   随后输出小标题 "**团队其他成员（N 条）**" 再逐条列；某组为空则不输出该小标题；
+5. 每条记录占一行，以 "- " 开头，保留记录中的项目名与具体事实；他人记录需在末尾补充作者；
+6. 第一段之前单独输出一行工作量统计，格式为 "工作量：本人 X 条 / 团队合计 Y 条（Z 人）"；
+7. 不要输出开场白、结尾总结、寒暄或评价性套话（如“努力工作”“认真负责”）。
 """
 
 
@@ -61,17 +64,21 @@ def _one_line(text: str, limit: int = 120) -> str:
     return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
 
 
-def _mock_line(record: RawRecord) -> str:
-    """Mock provider 的记录摘要：标题 + 细节 + 项目 + 时间。"""
+def _mock_line(record: RawRecord, with_author: bool = False) -> str:
+    """Mock provider 的记录摘要：标题 + 细节 + 项目 + 时间（他人记录附带作者）。"""
     stamp = record.timestamp.strftime("%H:%M")
+    tail = f"{record.project} · {stamp}"
+    if with_author:
+        tail = f"{tail} · {record.author}"
     if record.detail:
-        return f"- {record.title}：{_one_line(record.detail)}（{record.project} · {stamp}）"
-    return f"- {record.title}（{record.project} · {stamp}）"
+        return f"- {record.title}：{_one_line(record.detail)}（{tail}）"
+    return f"- {record.title}（{tail}）"
 
 
-def _template_line(record: RawRecord) -> str:
-    """纯模板方案的最简拼接：标题 + 项目。"""
-    return f"- {record.title}（{record.project}）"
+def _template_line(record: RawRecord, with_author: bool = False) -> str:
+    """纯模板方案的最简拼接：标题 + 项目（他人记录附带作者）。"""
+    suffix = f" · {record.author}" if with_author else ""
+    return f"- {record.title}（{record.project}{suffix}）"
 
 
 def _has_all_sections(text: str) -> bool:
@@ -106,6 +113,18 @@ class LLMGenerator:
         self.provider = provider
         #: 本次生成是否降级，以及降级原因（供编排层记录日志）
         self.degraded_reason: str | None = None
+        #: 用于判定"我"的账号别名集合（Gitee/GitHub 登录名或昵称，大小写不敏感）
+        self._identities = self._build_identities(config)
+
+    @staticmethod
+    def _build_identities(config: Config) -> set[str]:
+        """构造身份别名集合：收录 ``REPORT_IDENTITIES`` 与 ``REPORT_AUTHOR``。"""
+        names = {*config.report_identities, config.report_author}
+        return {name.strip().lower() for name in names if name and name.strip()}
+
+    def _is_mine(self, record: RawRecord) -> bool:
+        """判断该记录是否由日报作者本人产出。"""
+        return record.author.strip().lower() in self._identities
 
     def generate_report(
         self, records_by_status: Mapping[str, Sequence[RawRecord]], author: str, role: str
@@ -157,18 +176,43 @@ class LLMGenerator:
     def _render_body(
         self,
         records_by_status: Mapping[str, Sequence[RawRecord]],
-        line_builder: Callable[[RawRecord], str],
+        line_builder: Callable[..., str],
     ) -> str:
-        """按固定三段结构拼接正文；空段写 ``- 无``。"""
+        """按固定三段结构拼接正文：段内区分「我的工作」与「团队其他成员」，空段写 ``- 无``。"""
         blocks: list[str] = []
         for key, section in _GROUP_SECTION:
             items = list(records_by_status.get(key) or [])
             lines = [f"【{section}】"]
-            lines.extend(line_builder(item) for item in items)
             if not items:
                 lines.append("- 无")
+                blocks.append("\n".join(lines))
+                continue
+            mine = [item for item in items if self._is_mine(item)]
+            others = [item for item in items if not self._is_mine(item)]
+            if mine:
+                lines.append(f"**我的工作（{len(mine)} 条）**")
+                lines.extend(line_builder(item, False) for item in mine)
+            if others:
+                lines.append(f"**团队其他成员（{len(others)} 条）**")
+                lines.extend(line_builder(item, True) for item in others)
             blocks.append("\n".join(lines))
-        return "\n\n".join(blocks)
+        return f"{self._workload_line(records_by_status)}\n\n" + "\n\n".join(blocks)
+
+    def _workload_line(self, records_by_status: Mapping[str, Sequence[RawRecord]]) -> str:
+        """生成工作量统计行：本人条数 / 团队合计 / 参与人数。"""
+        records = [
+            record for key, _ in _GROUP_SECTION for record in (records_by_status.get(key) or [])
+        ]
+        mine = [record for record in records if self._is_mine(record)]
+        teammate_authors = {
+            record.author for record in records if not self._is_mine(record) and record.author
+        }
+        if teammate_authors:
+            return (
+                f"工作量：本人 {len(mine)} 条 / 团队合计 {len(records)} 条"
+                f"（其他 {len(teammate_authors)} 人）"
+            )
+        return f"工作量：本人 {len(mine)} 条"
 
     @staticmethod
     def _empty_body() -> str:
@@ -176,11 +220,10 @@ class LLMGenerator:
         blocks = [f"【{section}】\n- 无" for section in SECTION_ORDER]
         return f"{NO_DATA_TEXT}\n\n" + "\n\n".join(blocks)
 
-    @staticmethod
     def _build_prompt(
-        records_by_status: Mapping[str, Sequence[RawRecord]], author: str, role: str
+        self, records_by_status: Mapping[str, Sequence[RawRecord]], author: str, role: str
     ) -> str:
-        """构造 LLM Prompt（强制约束"无数据禁编造"）。"""
+        """构造 LLM Prompt（强制约束"无数据禁编造"，并标注记录归属）。"""
         parts = [_PROMPT_RULES, f"【作者】{author}", f"【岗位】{role}", "【待整理记录】"]
         for key, section in _GROUP_SECTION:
             items = list(records_by_status.get(key) or [])
@@ -191,7 +234,8 @@ class LLMGenerator:
             for record in items:
                 stamp = record.timestamp.strftime("%Y-%m-%d %H:%M")
                 detail = f"；{_one_line(record.detail)}" if record.detail else ""
-                parts.append(f"- [{record.project}][{stamp}] {record.title}{detail}")
+                owner = "本人" if self._is_mine(record) else f"团队·{record.author}"
+                parts.append(f"- [{owner}][{record.project}][{stamp}] {record.title}{detail}")
         parts.append("请按约束输出三段式日报正文。")
         return "\n".join(parts)
 

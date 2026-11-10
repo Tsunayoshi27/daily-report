@@ -34,6 +34,11 @@ SECTION_PATTERN = re.compile(
 _BULLET_PREFIXES: tuple[str, ...] = ("-", "*", "•", "·")
 
 
+def _is_preformatted(item: str) -> bool:
+    """已是列表项或以 ``**`` 包裹的子标题，原样输出。"""
+    return item.startswith(_BULLET_PREFIXES) or item.startswith("**")
+
+
 @dataclass(frozen=True, slots=True)
 class RoleWording:
     """岗位话术库条目，对应 proposal「研发/产品/运营/销售 4 套专属话术库」。"""
@@ -73,7 +78,7 @@ class TemplateEngine:
             TemplateError: 正文缺少三段结构标记，或岗位角色不受支持。
         """
         wording = self._resolve_wording(role)
-        sections = self._split_sections(report.content)
+        preamble, sections = self._split_sections(report.content)
 
         lines: list[str] = [
             f"# {wording.label}工作日报",
@@ -81,13 +86,17 @@ class TemplateEngine:
             f"- 作者：{report.author}",
             f"- 岗位：{wording.label}（{self._role_value(role)}）",
             f"- 日期：{report.date.isoformat()}",
-            "",
         ]
+        for item in preamble:
+            # 正文首部的工作量统计提升到抬头区，便于一眼看到"我做了什么"
+            lines.append(f"- {item}" if not item.startswith("-") else item)
+        lines.append("")
+
         for index, name in enumerate(SECTION_ORDER):
             lines.append(f"## {name}（{wording.qualifiers[index]}）")
             body = sections[name] or [f"- {wording.empty_placeholder}"]
             for item in body:
-                lines.append(item if item.startswith(_BULLET_PREFIXES) else f"- {item}")
+                lines.append(item if _is_preformatted(item) else f"- {item}")
             lines.append("")
 
         _LOGGER.debug("模板渲染完成：作者=%s 岗位=%s", report.author, role)
@@ -113,12 +122,13 @@ class TemplateEngine:
         return _ROLE_WORDING[role_enum]
 
     @staticmethod
-    def _split_sections(content: str) -> dict[str, list[str]]:
-        """按段标记切分正文。
+    def _split_sections(content: str) -> tuple[list[str], dict[str, list[str]]]:
+        """按段标记切分正文，返回 ``(段前内容, 各段正文)``。
 
         Raises:
             TemplateError: 三段标记未全部出现（结构被破坏）。
         """
+        preamble: list[str] = []
         sections: dict[str, list[str]] = {name: [] for name in SECTION_ORDER}
         found: set[str] = set()
         current: str | None = None
@@ -132,7 +142,8 @@ class TemplateEngine:
                 found.add(current)
                 continue
             if current is None:
-                # 段标记之前的内容（标题、作者行等）不属于任何一段，忽略
+                # 段标记之前的行（如工作量统计）作为抬头区内容
+                preamble.append(line)
                 continue
             sections[current].append(line)
 
@@ -141,4 +152,4 @@ class TemplateEngine:
             raise TemplateError(
                 "日报正文缺少三段结构标记：" + "、".join(missing) + "（三段结构不可变）"
             )
-        return sections
+        return preamble, sections

@@ -12,6 +12,7 @@
 |------|------|
 | 多源自动采集 | GitHub 提交、Gitee 提交、飞书任务、Mock 模拟数据，多源**并行**采集（≤3 线程） |
 | 三段式生成 | 固定结构「今日完成 / 明日计划 / 风险阻塞」，结构不可变 |
+| 按人分组 | 每段内区分「我的工作」与「团队其他成员」，抬头显示本人/团队工作量统计 |
 | 岗位话术库 | 研发 / 产品 / 运维 / 销售 4 套措辞，自动匹配岗位 |
 | 空话过滤 | 自动删除纯套话行，空话占比 >30% 时给出告警 |
 | 禁止编造 | 无任何数据时抛出 `EmptyDataError`；LLM 侧 Prompt 硬约束「无数据只输出 - 无」 |
@@ -57,6 +58,14 @@ Copy-Item .env.example .env      # macOS/Linux: cp .env.example .env
 ```
 
 按 `.env` 注释填写：代码托管 Token（GitHub 或 Gitee 至少一个）、GitHub/Gitee 仓库、飞书 App ID/Secret、SMTP 账号与授权码、日报作者与岗位。
+
+其中作者显示名与身份识别要这样填（才能正确区分"我的工作"和"团队的工作"）：
+
+```ini
+REPORT_AUTHOR=乐天溪                              # 抬头显示的名字（建议用 Gitee 昵称）
+REPORT_IDENTITIES=tsunayoshi,乐天溪,Tsunayoshi27  # 你本人的各平台账号，逗号分隔
+REPORT_ROLE=dev
+```
 
 > `.env` 已在 `.gitignore` 中，**严禁提交**。凭证只从环境变量读取，代码中无任何硬编码。
 

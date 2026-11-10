@@ -252,7 +252,7 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
 | **入参** | `records_by_status`: assemble_report 的输出（done/pending/blocked 三组）；`author`: 日报作者；`role`: 岗位角色 |
 | **出参** | `str`，自然语言日报正文（含三段结构） |
 | **错误码** | `LLMTimeoutError` — LLM 调用超时（30秒）；`LLMConnectionError` — LLM 服务不可达；`EmptyResponseError` — LLM 返回空内容 |
-| **行为约束** | 调用私有化 LLM（详见 ADR-004）；Prompt 中强制约束"无数据源时输出'今日无记录'，禁止编造"；超时30秒后降级为纯模板方案（直接拼接记录摘要） |
+| **行为约束** | 调用私有化 LLM（详见 ADR-004）；Prompt 中强制约束"无数据源时输出'今日无记录'，禁止编造"；超时30秒后降级为纯模板方案（直接拼接记录摘要）；段内按「我的工作 / 团队其他成员」分组输出，并在正文首行给出工作量统计（本人条数 / 团队合计 / 参与人数），身份识别规则见 ADR-009 |
 
 #### `filter_content(content: str) -> tuple[str, list[str]]`
 
@@ -270,7 +270,7 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
 | **入参** | `report`: 日报实体（使用 `report.content` 作为正文）；`role`: 岗位角色（匹配话术库） |
 | **出参** | `str`，三段式格式化文本（加标题头、作者行、日期行等） |
 | **错误码** | `TemplateError` — 模板文件缺失或格式错误 |
-| **行为约束** | 模板结构不可变（三段固定）；措辞按角色匹配话术库 |
+| **行为约束** | 模板结构不可变（三段固定）；措辞按角色匹配话术库；抬头区固定输出作者、岗位、日期与工作量统计；段内保留「我的工作 / 团队其他成员」分组小标题（分组属于段内呈现，不新增或删除段落） |
 
 ### 4.3 推送层接口
 
@@ -387,6 +387,17 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
 | **决策** | 选择 **方案 A** |
 | **理由** | 1) Gitee OpenAPI v5 与 GitHub 的提交列表结构基本同构（`sha` / `commit.message` / `commit.author.date` / `html_url` / `author.login`），解析逻辑可完全复用，新增成本低；2) 方案 B 有三处硬阻碍：鉴权方式不同（Gitee 用 URL query `access_token`，GitHub 用 `Authorization` 头）、记录 `source` 会被错误标为 `github`（数据失真，违反写实原则）、破坏数据模型契约；3) 方案 C 无法覆盖团队真实工作痕迹；4) 符合 design.md 6.5「新增数据源只需新增一个 Collector 类」的扩展约定 |
 | **影响与约束** | ①`RawRecord.source` 枚举新增 `gitee`；②凭证校验由"GitHub Token 必填"放宽为"GitHub Token 与 Gitee Token **至少填一个**"，且 Gitee Token 允许为空（公开仓库匿名可读）；③Gitee token 出现在 URL 中，依赖 `SensitiveDataFilter` 完成脱敏（已实测 `access_token=***`）；④采集线程池上限仍为 3（design.md 6.1 不变），未配置的源会立即返回空列表，实际不产生排队等待；⑤若同一批提交在 GitHub 与 Gitee 镜像仓库并存，编排层按「标题 + 时间戳」**跨源去重**，并优先保留 Gitee 归属（团队主战场），避免日报把同一工作写两遍 |
+
+### ADR-009：日报按人分组与作者身份识别
+
+| 项 | 内容 |
+|----|------|
+| **状态** | 已采纳 |
+| **背景** | 团队成员在 Gitee / GitHub 上的账号名不一致（同一个人在 Gitee 显示昵称「乐天溪」、在 GitHub 显示登录名「tsunayoshi」）；员工既要看到"我今天做了什么"，也要看到"团队今天做了什么"，而原实现把全部记录混在一段里，且抬头作者取的是 GitHub 登录名 |
+| **备选项** | A. 抬头作者与分组全部由配置显式声明（`REPORT_AUTHOR` + `REPORT_IDENTITIES`）；B. 启动时用 Gitee `/user` 接口自动解析昵称；C. 不分组，仅把作者名换成昵称 |
+| **决策** | 选择 **方案 A** |
+| **理由** | 1) 方案 B 需额外一次网络请求与降级分支，且只能拿到 Gitee 侧身份，GitHub 侧仍需配置，收益不足以抵消复杂度；2) 一人多平台账号的映射本质上是"人的身份"，交给使用者显式声明最准确、可审计；3) 方案 C 无法满足"单独看我的工作量"的核心诉求 |
+| **实现约束** | ①`REPORT_AUTHOR` 作为抬头显示名与文件名（可用 Gitee 昵称）；②`REPORT_IDENTITIES` 为逗号分隔的账号别名集合，匹配时大小写不敏感，`REPORT_AUTHOR` 自动并入该集合；③分组发生在 `LLMGenerator` 内部，**不改变三段结构**（仅在三段内加「我的工作 / 团队其他成员」小标题）；④正文首行输出工作量统计（本人条数 / 团队合计 / 其他成员人数）；⑤他人条目在末尾附带作者名，便于区分责任人；⑥`RawRecord` 数据模型不变 |
 
 ---
 

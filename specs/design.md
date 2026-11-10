@@ -342,6 +342,16 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
 | **决策** | 选择 **python-dotenv + 自定义 Config 数据类** |
 | **理由** | 1) python-dotenv 是轻量级依赖（仅一个文件），比 pydantic-settings 简单得多；2) Config 数据类在启动时集中校验必填字段，缺失立即报错而非运行时才发现；3) 所有模块通过依赖注入获取 Config 实例，不直接读环境变量，便于测试。否决 pydantic-settings 是为了控制依赖数量（与 ADR-003 轻量原则一致）；否决纯手写是因为 .env 文件解析的边界情况多，不值得重造轮子 |
 
+### ADR-006：Word 文档导出库选型
+
+| 项 | 内容 |
+|----|------|
+| **状态** | 已采纳 |
+| **背景** | `FileExporter` 需将日报导出为 Word 格式（`export_file` 支持 `"docx"`），需要选择一个 docx 生成库 |
+| **备选项** | A. `python-docx` — 最成熟的 docx 读写库；B. 直接生成 docx XML — 零依赖但复杂度高；C. `pandoc` 外部工具 — 功能强但引入外部依赖 |
+| **决策** | 选择 **python-docx** |
+| **理由** | 1) 社区最活跃、文档最全的 Python docx 库；2) API 简洁（`Document()` → `add_paragraph()`），满足日报纯文本导出需求；3) 纯 Python 实现，安装简单。否决直接生成 docx XML 是因为需要手写 OOXML 结构，开发成本远超收益；否决 pandoc 是因为引入外部二进制工具，与"私有化轻量部署"目标冲突 |
+
 ---
 
 ## 6. 非功能性约束

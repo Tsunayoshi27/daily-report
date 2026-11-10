@@ -14,6 +14,7 @@
 | 管理端（全员查看 / 风险汇总 / 提交率看板） | v1 先完成单日报闭环，管理端依赖多用户数据积累 |
 | OA 办公平台推送 | v1 仅支持邮件 + 文件导出，v1.1 接入 OA |
 | 手动补充输入界面 | v1 通过命令行参数/文件输入支持，v1.1 做交互式输入 |
+| 飞书用户授权（user_access_token） | v1 的飞书链路已完成鉴权、Token 缓存与采集，但应用身份（tenant_access_token）只能读取「应用自身创建的任务」；要读取员工个人任务需员工 OAuth 授权，v1.1 实现（见 ADR-007） |
 
 ---
 
@@ -83,6 +84,7 @@ SQLite ─── 持久化日报记录与版本快照
 |------|--------|-----------|
 | `Orchestrator` | 主编排入口 | 按"采集→生成→推送"流程调度各模块，统一异常处理和日志 |
 | `GitHubCollector` | 采集层 | 通过 GitHub API 拉取指定仓库的当日 commit 记录 |
+| `GiteeCollector` | 采集层 | 通过 Gitee OpenAPI v5 拉取指定仓库的当日 commit 记录（私有仓库需 Token，公开仓库可匿名） |
 | `FeishuCollector` | 采集层 | 通过飞书开放平台 API 拉取当日任务/消息 |
 | `MockCollector` | 采集层 | 返回模拟数据，用于开发调试和凭证未就绪时的主流程验证 |
 | `LLMGenerator` | 生成层 | 调用私有化部署 LLM，将 RawRecord 列表生成为自然语言日报正文 |
@@ -101,7 +103,7 @@ SQLite ─── 持久化日报记录与版本快照
 
 | 字段 | 类型 | 说明 | 约束 |
 |------|------|------|------|
-| `source` | str | 数据来源 | 必填，枚举：`github` / `feishu` / `mock` / `manual` |
+| `source` | str | 数据来源 | 必填，枚举：`github` / `gitee` / `feishu` / `mock` / `manual` |
 | `timestamp` | datetime | 记录时间 | 必填 |
 | `project` | str | 所属项目 | 必填 |
 | `title` | str | 记录标题（如 commit message、任务名） | 必填，长度 ≤ 500 |
@@ -203,6 +205,16 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
 | **错误码** | `ConnectionError` — GitHub API 不可达；`AuthError` — Token 无效或过期；`RateLimitError` — API 速率限制 |
 | **行为约束** | 请求频率 ≤ 1 次/秒，含 3 次指数退避重试（间隔 1s/2s/4s） |
 
+#### `collect_gitee(repos: list[str], date: date) -> list[RawRecord]`
+
+| 项 | 说明 |
+|----|------|
+| **入参** | `repos`: 仓库列表，格式 `"owner/repo"`；`date`: 采集日期；Token 在 `__init__` 中从环境变量 `GITEE_TOKEN` 读取（**允许为空**，公开仓库可匿名访问） |
+| **出参** | `list[RawRecord]`，该日期内所有仓库的 commit 记录；`status` 默认 `done`；`source` 标记为 `gitee` |
+| **错误码** | `ConnectionError` — Gitee API 不可达；`AuthError` — Token 无效或无权访问仓库；`RateLimitError` — API 速率限制 |
+| **行为约束** | 鉴权通过 **URL query 参数** `access_token` 传递（Gitee 不支持 GitHub 式的 Authorization 头）；日志层需确保 token 被脱敏为 `access_token=***`；请求频率 ≤ 1 次/秒，含 3 次指数退避重试（间隔 1s/2s/4s） |
+| **实现依据** | 见 ADR-008 |
+
 #### `collect_feishu(date: date) -> list[RawRecord]`
 
 | 项 | 说明 |
@@ -210,7 +222,9 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
 | **入参** | `date`: 采集日期；App ID/Secret 在 `__init__` 中从环境变量 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 读取 |
 | **出参** | `list[RawRecord]`，该日期内的任务/消息记录；`status` 根据任务状态字段映射为 `done` / `pending` / `blocked` |
 | **错误码** | `ConnectionError` — 飞书 API 不可达；`AuthError` — 凭证无效；`TokenExpiredError` — tenant_access_token 过期 |
-| **行为约束** | 先获取 tenant_access_token 再调业务接口；Token 缓存至过期前 5 分钟刷新 |
+| **行为约束** | 先获取 tenant_access_token 再调业务接口；Token 缓存至过期前 5 分钟刷新；权限不足（`99991672` 等）与凭证无效归为 `AuthError` 且不重试 |
+| **数据范围** | tenant_access_token 只能读取「应用自身创建的任务」，无法读取员工手工创建的任务（平台身份模型限制，见 ADR-007）。因此返回空列表属于正常现象，不得据此判定采集失败 |
+| **字段映射** | 标题取 `summary`、描述取 `description`、创建时间取 `create_time`、完成时间取 `complete_time`（`"0"` 表示未完成）：`complete_time` 非 0 → `done`，否则 `pending` |
 
 #### `collect_mock(date: date) -> list[RawRecord]`
 
@@ -352,6 +366,28 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
 | **决策** | 选择 **python-docx** |
 | **理由** | 1) 社区最活跃、文档最全的 Python docx 库；2) API 简洁（`Document()` → `add_paragraph()`），满足日报纯文本导出需求；3) 纯 Python 实现，安装简单。否决直接生成 docx XML 是因为需要手写 OOXML 结构，开发成本远超收益；否决 pandoc 是因为引入外部二进制工具，与"私有化轻量部署"目标冲突 |
 
+### ADR-007：飞书身份模型与用户授权方案
+
+| 项 | 内容 |
+|----|------|
+| **状态** | v1 采纳应用身份（A）；用户授权（B）延至 v1.1 |
+| **背景** | `FeishuCollector` 需要读取员工当日任务，而飞书开放平台提供两套身份：`tenant_access_token`（应用身份）与 `user_access_token`（用户身份） |
+| **备选项** | A. 应用身份（tenant_access_token）；B. 用户身份（user_access_token，OAuth 授权码模式）；C. 应用身份 + 由应用先创建任务再读取 |
+| **决策** | v1 采用 **方案 A**，方案 B 列入 v1.1 交付项 |
+| **理由** | 1) 官方文档明确：tenant_access_token 只能获取「应用自身通过创建任务接口创建的任务」，覆盖不到员工手工创建的任务；2) 方案 C 等于由系统凭空造数据，违反 proposal「无数据源禁止编造」红线，直接否决；3) 方案 B 需在飞书后台配置用户身份权限与重定向 URL、走授权码换取 token、并持久化 refresh_token（长期凭证），且每个使用者需各自授权，与 v1「单员工命令行闭环」目标不匹配，故延后；4) 采用方案 A 后，飞书链路的鉴权、Token 缓存、状态映射、重试与降级均已打通可验证，团队尚未产生任务时返回空列表不视为故障 |
+| **v1.1 实施要点** | ①飞书后台增加用户身份权限 `task:task:readonly` 并配置重定向 URL；②新增登录 CLI，用本地回调接收授权码，调用 `POST /open-apis/authen/v2/oauth/token` 换取 token；③`refresh_token` 仅存于 `.env`（严禁入库、严禁入日志），过期前自动刷新；④`FeishuCollector` 增加 user token 模式，`collect(date)` 签名保持不变 |
+
+### ADR-008：代码托管源接入 Gitee
+
+| 项 | 内容 |
+|----|------|
+| **状态** | 已采纳（v1 内实现，与 GitHub 并列） |
+| **背景** | 团队成员日常工作主要在 Gitee 完成，仅接 GitHub 会导致"真实提交记录缺失"，直接影响日报写实度；proposal 3.1 只要求"代码提交记录"这一能力，未限定平台 |
+| **备选项** | A. 新增独立 `GiteeCollector`；B. 复用 `GitHubCollector`、把 base_url 指向 Gitee；C. 仅接入 GitHub |
+| **决策** | 选择 **方案 A** |
+| **理由** | 1) Gitee OpenAPI v5 与 GitHub 的提交列表结构基本同构（`sha` / `commit.message` / `commit.author.date` / `html_url` / `author.login`），解析逻辑可完全复用，新增成本低；2) 方案 B 有三处硬阻碍：鉴权方式不同（Gitee 用 URL query `access_token`，GitHub 用 `Authorization` 头）、记录 `source` 会被错误标为 `github`（数据失真，违反写实原则）、破坏数据模型契约；3) 方案 C 无法覆盖团队真实工作痕迹；4) 符合 design.md 6.5「新增数据源只需新增一个 Collector 类」的扩展约定 |
+| **影响与约束** | ①`RawRecord.source` 枚举新增 `gitee`；②凭证校验由"GitHub Token 必填"放宽为"GitHub Token 与 Gitee Token **至少填一个**"，且 Gitee Token 允许为空（公开仓库匿名可读）；③Gitee token 出现在 URL 中，依赖 `SensitiveDataFilter` 完成脱敏（已实测 `access_token=***`）；④采集线程池上限仍为 3（design.md 6.1 不变），未配置的源会立即返回空列表，实际不产生排队等待；⑤若同一批提交在 GitHub 与 Gitee 镜像仓库并存，编排层按「标题 + 时间戳」**跨源去重**，并优先保留 Gitee 归属（团队主战场），避免日报把同一工作写两遍 |
+
 ---
 
 ## 6. 非功能性约束
@@ -402,4 +438,4 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
 | LLM 可切换 | `LLMGenerator` 通过 `provider` 参数切换 Mock / Ollama / 未来其他后端 |
 | 推送渠道可扩展 | 推送层通过统一接口接入，新增推送渠道只需新增一个 Pusher 类 |
 | 日志完整 | 全链路操作留日志，包含时间戳、模块名、操作、结果 |
-| 版本快照 | 每次编辑自动保存历史版本，可回溯 AI 初稿和各次人工修改 |
+| 版本快照 | 正文发生变化时自动保存历史版本（内容与最新版相同则不重复记录），可回溯 AI 初稿和各次人工修改 |

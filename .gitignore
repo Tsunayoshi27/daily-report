@@ -12,3 +12,9 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# 运行期产物
+data/
+output/
+logs/*.log
+logs/*.log.*

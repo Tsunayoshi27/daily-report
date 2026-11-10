@@ -1,2 +1,6 @@
-def main() -> None:
-    print("Hello from daily-report-tool!")
+"""智能日报生成器。
+
+四层架构：主编排入口 → 采集层 → 生成层 → 推送层（详见 specs/design.md）。
+"""
+
+__version__ = "0.1.0"

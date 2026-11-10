@@ -1,112 +1,85 @@
-import os
+"""命令行入口（design.md 4.4 ``main``）。
+
+用法::
+
+    uv run daily-report-tool                 # 生成当天日报
+    uv run daily-report-tool --date 2026-11-10
+
+流程：加载配置 → 初始化日志（含脱敏）→ Orchestrator 编排 → 返回 DailyReport。
+任一环节的异常都会向上抛出（由调用方/CLI 统一记录），符合 design.md 4.4 的契约。
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import logging
 import sys
-import platform
 
-_PLACEHOLDER_MARKERS = [
-    "在这里填", "找测试同学要", "发件邮箱地址", "邮箱SMTP授权码",
-    "your_", "YOUR_", "TODO", "todo",
-]
+from daily_report_tool.models import DailyReport
+from daily_report_tool.orchestrator import Orchestrator
+from daily_report_tool.utils.config import Config
+from daily_report_tool.utils.exceptions import DailyReportError
+from daily_report_tool.utils.logging_setup import setup_logging
 
+_LOGGER = logging.getLogger(__name__)
 
-def _is_placeholder(value):
-    if not value or not value.strip():
-        return True
-    for marker in _PLACEHOLDER_MARKERS:
-        if marker in value:
-            return True
-    return False
+_LOG_FILE_NAME = "daily_report.log"
 
 
-def check_python_version():
-    version = sys.version_info
-    version_str = f"{version.major}.{version.minor}.{version.micro}"
-    print(f"Python 版本: {version_str}")
-    print(f"完整信息: {sys.version}")
-    print(f"可执行路径: {sys.executable}")
-    print(f"操作系统: {platform.system()} {platform.release()} {platform.machine()}")
-    print(f"处理器: {platform.processor() or 'N/A'}")
-    print()
+def main(date: datetime.date | None = None) -> DailyReport:
+    """生成指定日期的日报。
 
-    if version.major == 3 and version.minor >= 12:
-        print(f"✅ Python {version_str} 满足要求 (>= 3.12)")
-        return True
-    else:
-        print(f"❌ Python {version_str} 不满足要求 (需要 >= 3.12)")
-        return False
+    Args:
+        date: 日报日期，默认当天。
 
+    Returns:
+        完整的日报实体（已入库、已尝试推送）。
 
-def check_common_modules():
-    modules = ["pip", "os", "sys", "json", "datetime", "pathlib"]
-    print("\n--- 常用模块检查 ---")
-    ok = 0
-    for mod in modules:
-        try:
-            __import__(mod)
-            print(f"  ✅ {mod}")
-            ok += 1
-        except ImportError:
-            print(f"  ❌ {mod} 未安装")
-    print(f"\n模块加载: {ok}/{len(modules)} 成功")
-    return ok == len(modules)
+    Raises:
+        ValueError: 配置缺失或非法（如凭证未配置、岗位角色非法）。
+        EmptyDataError: 当日没有任何可用工作记录。
+        其余各层异常按 design.md 4.4 向上透传。
+    """
+    config = Config.load()
+    setup_logging(config.log_level, config.log_dir / _LOG_FILE_NAME)
+
+    orchestrator = Orchestrator(config)
+    try:
+        return orchestrator.run(date)
+    finally:
+        orchestrator.close()
 
 
-def check_credentials():
-    print("\n--- 数据凭证检查（仅验证是否配置，不显示值）---")
-    credentials = {
-        "GITHUB_PAT":       "GitHub 个人访问令牌",
-        "FEISHU_APP_ID":    "飞书应用 ID",
-        "FEISHU_APP_SECRET":"飞书应用密钥",
-        "SMTP_HOST":        "SMTP 服务器地址",
-        "SMTP_PORT":        "SMTP 端口",
-        "SMTP_USER":        "发件邮箱",
-        "SMTP_AUTH_CODE":   "邮箱 SMTP 授权码",
-    }
-    ok = 0
-    for key, label in credentials.items():
-        value = os.environ.get(key, "")
-        if value and not _is_placeholder(value):
-            print(f"  ✅ {label:20s}  已配置")
-            ok += 1
-        else:
-            print(f"  ⚠️  {label:20s}  未配置或为占位符")
-    print(f"\n凭证配置: {ok}/{len(credentials)} 项已就绪")
-    return ok
+def _build_parser() -> argparse.ArgumentParser:
+    """构造命令行参数解析器。"""
+    parser = argparse.ArgumentParser(
+        prog="daily-report-tool", description="智能日报生成器：采集 → 生成 → 推送"
+    )
+    parser.add_argument(
+        "--date",
+        type=datetime.date.fromisoformat,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="日报日期，默认当天",
+    )
+    return parser
 
 
-def demo():
-    print("\n--- 功能演示 ---")
-    from datetime import datetime
-    now = datetime.now()
-    print(f"  当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+def _cli(argv: list[str] | None = None) -> int:
+    """命令行主函数，返回进程退出码。"""
+    args = _build_parser().parse_args(argv)
+    try:
+        report = main(args.date)
+    except (DailyReportError, ValueError, OSError) as exc:
+        # 日志系统可能尚未初始化成功，这里同时输出到控制台，保证错误可见
+        _LOGGER.error("日报生成失败：%s: %s", type(exc).__name__, exc)
+        print(f"日报生成失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
-    data = {"msg": "Hello, Gitee!", "items": [1, 2, 3]}
-    import json
-    print(f"  JSON 序列化: {json.dumps(data, ensure_ascii=False)}")
-
-    from pathlib import Path
-    p = Path(__file__).resolve().parent
-    print(f"  当前目录: {p}")
-    print(f"  目录存在: {p.exists()}")
+    print(f"日报生成成功：{report.date}（作者 {report.author}，记录 id={report.id}）")
+    return 0
 
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("     Python 环境验证脚本")
-    print("=" * 50)
-
-    v_ok = check_python_version()
-    m_ok = check_common_modules()
-    c_ok = check_credentials()
-    demo()
-
-    print("\n" + "=" * 50)
-    all_ok = v_ok and m_ok and c_ok >= 2
-    if v_ok and m_ok:
-        print("🎉 基础环境检查全部通过！")
-    else:
-        print("⚠️  基础环境检查未通过")
-    if c_ok >= 2:
-        print("✅ 凭证至少已配置 2 项")
-    else:
-        print("⚠️  凭证配置不足（至少需要 GitHub PAT）")
-    print("=" * 50)
+    sys.exit(_cli())
